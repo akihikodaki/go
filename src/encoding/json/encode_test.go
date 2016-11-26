@@ -33,6 +33,9 @@ type Optionals struct {
 	Br bool `json:"br"`
 	Bo bool `json:"bo,omitempty"`
 
+	Cr <-chan int `json:"cr"`
+	Co <-chan int `json:"co,omitempty"`
+
 	Ur uint `json:"ur"`
 	Uo uint `json:"uo,omitempty"`
 
@@ -47,6 +50,7 @@ var optionalsExpected = `{
  "mr": {},
  "fr": 0,
  "br": false,
+ "cr": [],
  "ur": 0,
  "str": {},
  "sto": {}
@@ -57,6 +61,11 @@ func TestOmitEmpty(t *testing.T) {
 	o.Sw = "something"
 	o.Mr = map[string]interface{}{}
 	o.Mo = map[string]interface{}{}
+
+	c := make(chan int)
+	o.Cr = c
+	o.Co = c
+	close(c)
 
 	got, err := MarshalIndent(&o, "", " ")
 	if err != nil {
@@ -125,6 +134,19 @@ func TestEncodeRenamedByteSlice(t *testing.T) {
 	}
 	if string(result) != expect {
 		t.Errorf(" got %s want %s", result, expect)
+	}
+}
+
+func TestUnsupportedChan(t *testing.T) {
+	c := make(chan int)
+	close(c)
+	v := chan<- int(c)
+	if _, err := Marshal(v); err != nil {
+		if _, ok := err.(*UnsupportedTypeError); !ok {
+			t.Errorf("for %v, got %T want UnsupportedTypeError", v, err)
+		}
+	} else {
+		t.Errorf("for %v, expected error", v)
 	}
 }
 

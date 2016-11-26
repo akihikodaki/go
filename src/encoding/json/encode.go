@@ -132,8 +132,10 @@ import (
 // Interface values encode as the value contained in the interface.
 // A nil interface value encodes as the null JSON value.
 //
-// Channel, complex, and function values cannot be encoded in JSON.
-// Attempting to encode such a value causes Marshal to return
+// Recieve-directed channel values encode as JSON arrays.
+//
+// Send-directred channel, complex, and function values cannot be encoded in
+// JSON. Attempting to encode such a value causes Marshal to return
 // an UnsupportedTypeError.
 //
 // JSON cannot represent cyclic data structures and Marshal does not
@@ -285,26 +287,8 @@ func (e *encodeState) error(err error) {
 	panic(err)
 }
 
-func isEmptyValue(v reflect.Value) bool {
-	switch v.Kind() {
-	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
-		return v.Len() == 0
-	case reflect.Bool:
-		return !v.Bool()
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return v.Int() == 0
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return v.Uint() == 0
-	case reflect.Float32, reflect.Float64:
-		return v.Float() == 0
-	case reflect.Interface, reflect.Ptr:
-		return v.IsNil()
-	}
-	return false
-}
-
 func (e *encodeState) reflectValue(v reflect.Value, opts encOpts) {
-	valueEncoder(v)(e, v, opts)
+	valueEncoder(v).encode(e, v, opts)
 }
 
 type encOpts struct {
@@ -318,17 +302,24 @@ type encoderFunc func(e *encodeState, v reflect.Value, opts encOpts)
 
 var encoderCache struct {
 	sync.RWMutex
-	m map[reflect.Type]encoderFunc
+	m map[reflect.Type]encoderFactory
 }
 
-func valueEncoder(v reflect.Value) encoderFunc {
+type encoder interface {
+	encode(e *encodeState, v reflect.Value, opts encOpts)
+	isEmptyValue(v reflect.Value) bool
+}
+
+type encoderFactory func() encoder
+
+func valueEncoder(v reflect.Value) encoder {
 	if !v.IsValid() {
-		return invalidValueEncoder
+		return newInvalidValueEncoder()
 	}
-	return typeEncoder(v.Type())
+	return typeEncoderFactory(v.Type())()
 }
 
-func typeEncoder(t reflect.Type) encoderFunc {
+func typeEncoderFactory(t reflect.Type) encoderFactory {
 	encoderCache.RLock()
 	f := encoderCache.m[t]
 	encoderCache.RUnlock()
@@ -342,19 +333,19 @@ func typeEncoder(t reflect.Type) encoderFunc {
 	// func is only used for recursive types.
 	encoderCache.Lock()
 	if encoderCache.m == nil {
-		encoderCache.m = make(map[reflect.Type]encoderFunc)
+		encoderCache.m = make(map[reflect.Type]encoderFactory)
 	}
 	var wg sync.WaitGroup
 	wg.Add(1)
-	encoderCache.m[t] = func(e *encodeState, v reflect.Value, opts encOpts) {
+	encoderCache.m[t] = func() encoder {
 		wg.Wait()
-		f(e, v, opts)
+		return f()
 	}
 	encoderCache.Unlock()
 
 	// Compute fields without lock.
 	// Might duplicate effort but won't hold other computations back.
-	f = newTypeEncoder(t, true)
+	f = newTypeEncoderFactory(t, true)
 	wg.Done()
 	encoderCache.Lock()
 	encoderCache.m[t] = f
@@ -367,62 +358,78 @@ var (
 	textMarshalerType = reflect.TypeOf(new(encoding.TextMarshaler)).Elem()
 )
 
-// newTypeEncoder constructs an encoderFunc for a type.
+// newTypeEncoderFactory constructs an encoderFactory for a type.
 // The returned encoder only checks CanAddr when allowAddr is true.
-func newTypeEncoder(t reflect.Type, allowAddr bool) encoderFunc {
+func newTypeEncoderFactory(t reflect.Type, allowAddr bool) encoderFactory {
 	if t.Implements(marshalerType) {
-		return marshalerEncoder
+		return newMarshalerEncoder
 	}
 	if t.Kind() != reflect.Ptr && allowAddr {
 		if reflect.PtrTo(t).Implements(marshalerType) {
-			return newCondAddrEncoder(addrMarshalerEncoder, newTypeEncoder(t, false))
+			return newCondAddrEncoderFactory(newAddrMarshalerEncoder,
+				newTypeEncoderFactory(t, false))
 		}
 	}
 
 	if t.Implements(textMarshalerType) {
-		return textMarshalerEncoder
+		return newTextMarshalerEncoder
 	}
 	if t.Kind() != reflect.Ptr && allowAddr {
 		if reflect.PtrTo(t).Implements(textMarshalerType) {
-			return newCondAddrEncoder(addrTextMarshalerEncoder, newTypeEncoder(t, false))
+			return newCondAddrEncoderFactory(newAddrTextMarshalerEncoder,
+				newTypeEncoderFactory(t, false))
 		}
 	}
 
 	switch t.Kind() {
 	case reflect.Bool:
-		return boolEncoder
+		return newBoolEncoder
+	case reflect.Chan:
+		return newChanEncoderFactory(t)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return intEncoder
+		return newIntEncoder
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return uintEncoder
+		return newUintEncoder
 	case reflect.Float32:
-		return float32Encoder
+		return newEncoderFactory(float32Encoder)
 	case reflect.Float64:
-		return float64Encoder
+		return newEncoderFactory(float64Encoder)
 	case reflect.String:
-		return stringEncoder
+		return newStringEncoder
 	case reflect.Interface:
-		return interfaceEncoder
+		return newInterfaceEncoder
 	case reflect.Struct:
-		return newStructEncoder(t)
+		return newEncoderFactory(newStructEncoder(t))
 	case reflect.Map:
-		return newMapEncoder(t)
+		return newEncoderFactory(newMapEncoder(t))
 	case reflect.Slice:
-		return newSliceEncoder(t)
+		return newEncoderFactory(newSliceEncoder(t))
 	case reflect.Array:
-		return newArrayEncoder(t)
+		return newEncoderFactory(newArrayEncoder(t))
 	case reflect.Ptr:
-		return newPtrEncoder(t)
+		return newEncoderFactory(newPtrEncoder(t))
 	default:
-		return unsupportedTypeEncoder
+		return newUnsupportedTypeEncoder
 	}
 }
 
-func invalidValueEncoder(e *encodeState, v reflect.Value, _ encOpts) {
+type invalidValueEncoder struct{}
+
+func (_ invalidValueEncoder) encode(e *encodeState, v reflect.Value, _ encOpts) {
 	e.WriteString("null")
 }
 
-func marshalerEncoder(e *encodeState, v reflect.Value, opts encOpts) {
+func (_ invalidValueEncoder) isEmptyValue(v reflect.Value) bool {
+	return false
+}
+
+func newInvalidValueEncoder() encoder {
+  return invalidValueEncoder{}
+}
+
+type marshalerEncoder struct{}
+
+func (_ marshalerEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 	if v.Kind() == reflect.Ptr && v.IsNil() {
 		e.WriteString("null")
 		return
@@ -438,7 +445,17 @@ func marshalerEncoder(e *encodeState, v reflect.Value, opts encOpts) {
 	}
 }
 
-func addrMarshalerEncoder(e *encodeState, v reflect.Value, _ encOpts) {
+func (_ marshalerEncoder) isEmptyValue(v reflect.Value) bool {
+	return false
+}
+
+func newMarshalerEncoder() encoder {
+  return marshalerEncoder{}
+}
+
+type addrMarshalerEncoder struct{}
+
+func (_ addrMarshalerEncoder) encode (e *encodeState, v reflect.Value, _ encOpts) {
 	va := v.Addr()
 	if va.IsNil() {
 		e.WriteString("null")
@@ -455,7 +472,17 @@ func addrMarshalerEncoder(e *encodeState, v reflect.Value, _ encOpts) {
 	}
 }
 
-func textMarshalerEncoder(e *encodeState, v reflect.Value, opts encOpts) {
+func (_ addrMarshalerEncoder) isEmptyValue(v reflect.Value) bool {
+	return false
+}
+
+func newAddrMarshalerEncoder() encoder {
+  return addrMarshalerEncoder{}
+}
+
+type textMarshalerEncoder struct{}
+
+func (_ textMarshalerEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 	if v.Kind() == reflect.Ptr && v.IsNil() {
 		e.WriteString("null")
 		return
@@ -468,7 +495,17 @@ func textMarshalerEncoder(e *encodeState, v reflect.Value, opts encOpts) {
 	e.stringBytes(b, opts.escapeHTML)
 }
 
-func addrTextMarshalerEncoder(e *encodeState, v reflect.Value, opts encOpts) {
+func (_ textMarshalerEncoder) isEmptyValue(v reflect.Value) bool {
+	return false
+}
+
+func newTextMarshalerEncoder() encoder {
+  return textMarshalerEncoder{}
+}
+
+type addrTextMarshalerEncoder struct{}
+
+func (_ addrTextMarshalerEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 	va := v.Addr()
 	if va.IsNil() {
 		e.WriteString("null")
@@ -482,7 +519,23 @@ func addrTextMarshalerEncoder(e *encodeState, v reflect.Value, opts encOpts) {
 	e.stringBytes(b, opts.escapeHTML)
 }
 
-func boolEncoder(e *encodeState, v reflect.Value, opts encOpts) {
+func (_ addrTextMarshalerEncoder) isEmptyValue(v reflect.Value) bool {
+	return false
+}
+
+func newAddrTextMarshalerEncoder() encoder {
+  return addrTextMarshalerEncoder{}
+}
+
+func newEncoderFactory(e encoder) encoderFactory {
+	return func() encoder {
+		return e
+	}
+}
+
+type boolEncoder struct{}
+
+func (_ boolEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 	if opts.quoted {
 		e.WriteByte('"')
 	}
@@ -496,7 +549,66 @@ func boolEncoder(e *encodeState, v reflect.Value, opts encOpts) {
 	}
 }
 
-func intEncoder(e *encodeState, v reflect.Value, opts encOpts) {
+func (_ boolEncoder) isEmptyValue(v reflect.Value) bool {
+	return !v.Bool()
+}
+
+func newBoolEncoder() encoder {
+  return boolEncoder{}
+}
+
+type chanEncoder struct{
+	elemEnc encoderFactory
+	recieved reflect.Value
+	present bool
+}
+
+func (ce chanEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
+	e.WriteByte('[')
+
+	if !ce.recieved.IsValid() {
+		ce.recieved, ce.present = v.Recv()
+	}
+
+	if ce.present {
+		ce.elemEnc().encode(e, ce.recieved, opts)
+
+		for {
+			recieved, present := v.Recv()
+			if !present {
+				break
+			}
+
+			e.WriteByte(',')
+			ce.elemEnc().encode(e, recieved, opts)
+		}
+	}
+
+	e.WriteByte(']')
+}
+
+func (ce *chanEncoder) isEmptyValue(v reflect.Value) bool {
+	if !ce.recieved.IsValid() {
+		ce.recieved, ce.present = v.Recv()
+	}
+
+	return !ce.present
+}
+
+func newChanEncoderFactory(t reflect.Type) encoderFactory {
+	if t.ChanDir() & reflect.RecvDir == 0 {
+		return newUnsupportedTypeEncoder
+	} else {
+		elemEnc := typeEncoderFactory(t.Elem())
+		return func() encoder {
+			return &chanEncoder{elemEnc: elemEnc}
+		}
+	}
+}
+
+type intEncoder struct{}
+
+func (_ intEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 	b := strconv.AppendInt(e.scratch[:0], v.Int(), 10)
 	if opts.quoted {
 		e.WriteByte('"')
@@ -507,7 +619,17 @@ func intEncoder(e *encodeState, v reflect.Value, opts encOpts) {
 	}
 }
 
-func uintEncoder(e *encodeState, v reflect.Value, opts encOpts) {
+func (_ intEncoder) isEmptyValue(v reflect.Value) bool {
+	return v.Int() == 0
+}
+
+func newIntEncoder() encoder {
+  return intEncoder{}
+}
+
+type uintEncoder struct{}
+
+func (_ uintEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 	b := strconv.AppendUint(e.scratch[:0], v.Uint(), 10)
 	if opts.quoted {
 		e.WriteByte('"')
@@ -516,6 +638,14 @@ func uintEncoder(e *encodeState, v reflect.Value, opts encOpts) {
 	if opts.quoted {
 		e.WriteByte('"')
 	}
+}
+
+func (_ uintEncoder) isEmptyValue(v reflect.Value) bool {
+	return v.Uint() == 0
+}
+
+func newUintEncoder() encoder {
+  return uintEncoder{}
 }
 
 type floatEncoder int // number of bits
@@ -535,12 +665,18 @@ func (bits floatEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 	}
 }
 
+func (bits floatEncoder) isEmptyValue(v reflect.Value) bool {
+	return v.Float() == 0
+}
+
 var (
-	float32Encoder = (floatEncoder(32)).encode
-	float64Encoder = (floatEncoder(64)).encode
+	float32Encoder = floatEncoder(32)
+	float64Encoder = floatEncoder(64)
 )
 
-func stringEncoder(e *encodeState, v reflect.Value, opts encOpts) {
+type stringEncoder struct{}
+
+func (_ stringEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 	if v.Type() == numberType {
 		numStr := v.String()
 		// In Go1.5 the empty string encodes to "0", while this is not a valid number literal
@@ -565,7 +701,17 @@ func stringEncoder(e *encodeState, v reflect.Value, opts encOpts) {
 	}
 }
 
-func interfaceEncoder(e *encodeState, v reflect.Value, opts encOpts) {
+func (_ stringEncoder) isEmptyValue(v reflect.Value) bool {
+	return v.Len() == 0
+}
+
+func newStringEncoder() encoder {
+  return stringEncoder{}
+}
+
+type interfaceEncoder struct{}
+
+func (_ interfaceEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 	if v.IsNil() {
 		e.WriteString("null")
 		return
@@ -573,13 +719,31 @@ func interfaceEncoder(e *encodeState, v reflect.Value, opts encOpts) {
 	e.reflectValue(v.Elem(), opts)
 }
 
-func unsupportedTypeEncoder(e *encodeState, v reflect.Value, _ encOpts) {
+func (_ interfaceEncoder) isEmptyValue(v reflect.Value) bool {
+	return v.IsNil()
+}
+
+func newInterfaceEncoder() encoder {
+  return interfaceEncoder{}
+}
+
+type unsupportedTypeEncoder struct{}
+
+func (_ unsupportedTypeEncoder) encode(e *encodeState, v reflect.Value, _ encOpts) {
 	e.error(&UnsupportedTypeError{v.Type()})
+}
+
+func (_ unsupportedTypeEncoder) isEmptyValue(v reflect.Value) bool {
+	panic(&UnsupportedTypeError{v.Type()})
+}
+
+func newUnsupportedTypeEncoder() encoder {
+	return unsupportedTypeEncoder{}
 }
 
 type structEncoder struct {
 	fields    []field
-	fieldEncs []encoderFunc
+	fieldEncs []encoderFactory
 }
 
 func (se *structEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
@@ -587,7 +751,9 @@ func (se *structEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 	first := true
 	for i, f := range se.fields {
 		fv := fieldByIndex(v, f.index)
-		if !fv.IsValid() || f.omitEmpty && isEmptyValue(fv) {
+		fe := se.fieldEncs[i]()
+		if !fv.IsValid() || f.omitEmpty &&
+                   fe.isEmptyValue(fv) {
 			continue
 		}
 		if first {
@@ -598,25 +764,29 @@ func (se *structEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 		e.string(f.name, opts.escapeHTML)
 		e.WriteByte(':')
 		opts.quoted = f.quoted
-		se.fieldEncs[i](e, fv, opts)
+		fe.encode(e, fv, opts)
 	}
 	e.WriteByte('}')
 }
 
-func newStructEncoder(t reflect.Type) encoderFunc {
+func (_ structEncoder) isEmptyValue(v reflect.Value) bool {
+	return false
+}
+
+func newStructEncoder(t reflect.Type) encoder {
 	fields := cachedTypeFields(t)
 	se := &structEncoder{
 		fields:    fields,
-		fieldEncs: make([]encoderFunc, len(fields)),
+		fieldEncs: make([]encoderFactory, len(fields)),
 	}
 	for i, f := range fields {
-		se.fieldEncs[i] = typeEncoder(typeByIndex(t, f.index))
+		se.fieldEncs[i] = typeEncoderFactory(typeByIndex(t, f.index))
 	}
-	return se.encode
+	return se
 }
 
 type mapEncoder struct {
-	elemEnc encoderFunc
+	elemEnc encoderFactory
 }
 
 func (me *mapEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
@@ -643,26 +813,32 @@ func (me *mapEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 		}
 		e.string(kv.s, opts.escapeHTML)
 		e.WriteByte(':')
-		me.elemEnc(e, v.MapIndex(kv.v), opts)
+		me.elemEnc().encode(e, v.MapIndex(kv.v), opts)
 	}
 	e.WriteByte('}')
 }
 
-func newMapEncoder(t reflect.Type) encoderFunc {
+func (_ mapEncoder) isEmptyValue(v reflect.Value) bool {
+	return v.Len() == 0
+}
+
+func newMapEncoder(t reflect.Type) encoder {
 	switch t.Key().Kind() {
 	case reflect.String,
 		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 	default:
 		if !t.Key().Implements(textMarshalerType) {
-			return unsupportedTypeEncoder
+			return newUnsupportedTypeEncoder()
 		}
 	}
-	me := &mapEncoder{typeEncoder(t.Elem())}
-	return me.encode
+	me := &mapEncoder{typeEncoderFactory(t.Elem())}
+	return me
 }
 
-func encodeByteSlice(e *encodeState, v reflect.Value, _ encOpts) {
+type byteSliceEncoder struct{}
+
+func (_ byteSliceEncoder) encode(e *encodeState, v reflect.Value, _ encOpts) {
 	if v.IsNil() {
 		e.WriteString("null")
 		return
@@ -684,6 +860,10 @@ func encodeByteSlice(e *encodeState, v reflect.Value, _ encOpts) {
 	e.WriteByte('"')
 }
 
+func (_ byteSliceEncoder) isEmptyValue(v reflect.Value) bool {
+	return v.Len() == 0
+}
+
 // sliceEncoder just wraps an arrayEncoder, checking to make sure the value isn't nil.
 type sliceEncoder struct {
 	arrayEnc encoderFunc
@@ -697,20 +877,24 @@ func (se *sliceEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 	se.arrayEnc(e, v, opts)
 }
 
-func newSliceEncoder(t reflect.Type) encoderFunc {
+func (_ sliceEncoder) isEmptyValue(v reflect.Value) bool {
+	return v.Len() == 0
+}
+
+func newSliceEncoder(t reflect.Type) encoder {
 	// Byte slices get special treatment; arrays don't.
 	if t.Elem().Kind() == reflect.Uint8 {
 		p := reflect.PtrTo(t.Elem())
 		if !p.Implements(marshalerType) && !p.Implements(textMarshalerType) {
-			return encodeByteSlice
+			return byteSliceEncoder{}
 		}
 	}
-	enc := &sliceEncoder{newArrayEncoder(t)}
-	return enc.encode
+	enc := &sliceEncoder{newArrayEncoder(t).encode}
+	return enc
 }
 
 type arrayEncoder struct {
-	elemEnc encoderFunc
+	elemEnc encoderFactory
 }
 
 func (ae *arrayEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
@@ -720,18 +904,22 @@ func (ae *arrayEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 		if i > 0 {
 			e.WriteByte(',')
 		}
-		ae.elemEnc(e, v.Index(i), opts)
+		ae.elemEnc().encode(e, v.Index(i), opts)
 	}
 	e.WriteByte(']')
 }
 
-func newArrayEncoder(t reflect.Type) encoderFunc {
-	enc := &arrayEncoder{typeEncoder(t.Elem())}
-	return enc.encode
+func (_ arrayEncoder) isEmptyValue(v reflect.Value) bool {
+	return v.Len() == 0
+}
+
+func newArrayEncoder(t reflect.Type) encoder {
+	enc := &arrayEncoder{typeEncoderFactory(t.Elem())}
+	return enc
 }
 
 type ptrEncoder struct {
-	elemEnc encoderFunc
+	elemEnc encoderFactory
 }
 
 func (pe *ptrEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
@@ -739,12 +927,16 @@ func (pe *ptrEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 		e.WriteString("null")
 		return
 	}
-	pe.elemEnc(e, v.Elem(), opts)
+	pe.elemEnc().encode(e, v.Elem(), opts)
 }
 
-func newPtrEncoder(t reflect.Type) encoderFunc {
-	enc := &ptrEncoder{typeEncoder(t.Elem())}
-	return enc.encode
+func (_ ptrEncoder) isEmptyValue(v reflect.Value) bool {
+	return v.IsNil()
+}
+
+func newPtrEncoder(t reflect.Type) encoder {
+	enc := &ptrEncoder{typeEncoderFactory(t.Elem())}
+	return enc
 }
 
 type condAddrEncoder struct {
@@ -759,11 +951,17 @@ func (ce *condAddrEncoder) encode(e *encodeState, v reflect.Value, opts encOpts)
 	}
 }
 
-// newCondAddrEncoder returns an encoder that checks whether its value
-// CanAddr and delegates to canAddrEnc if so, else to elseEnc.
-func newCondAddrEncoder(canAddrEnc, elseEnc encoderFunc) encoderFunc {
-	enc := &condAddrEncoder{canAddrEnc: canAddrEnc, elseEnc: elseEnc}
-	return enc.encode
+func (_ condAddrEncoder) isEmptyValue(v reflect.Value) bool {
+	return false
+}
+
+// newCondAddrEncoderFactory returns an encoderFactory that makes an encoder
+// which checks whether its value CanAddr and delegates to canAddrEnc if so,
+// else to elseEnc.
+func newCondAddrEncoderFactory(canAddrEnc, elseEnc encoderFactory) encoderFactory {
+	return func() encoder {
+		return &condAddrEncoder{canAddrEnc: canAddrEnc().encode, elseEnc: elseEnc().encode}
+	}
 }
 
 func isValidTag(s string) bool {
